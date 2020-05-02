@@ -19,6 +19,11 @@ except ImportError:
     pass
 
 
+class CARLAEvent(enum.Enum):
+    """Available events (callbacks) related to CARLAEnvironment"""
+    RESET = 0
+
+
 class CARLAEnvironment(Environment):
     """A TensorForce Environment for the [CARLA driving simulator](https://github.com/carla-simulator/carla).
         - This environment is "synchronized" with the server, meaning that the server waits for a client tick. For a
@@ -149,6 +154,7 @@ class CARLAEnvironment(Environment):
 
     def reset(self, soft=False):
         self._reset_world(soft=soft)
+        self.trigger_event(event=CARLAEvent.RESET)
 
         # reset actions
         self.control = carla.VehicleControl()
@@ -198,8 +204,8 @@ class CARLAEnvironment(Environment):
         for sensor in self.sensors.values():
             sensor.destroy()
 
-    def train(self, agent: Optional[Agent], num_episodes: int, max_episode_timesteps: int, weights_dir='weights/agents',
-              agent_name='carla-agent', load_agent=False, record_dir='data/recordings', skip_frames=25):
+    def train(self, agent: Optional[Agent], num_episodes: int, max_episode_timesteps: int, weights_dir='weights/',
+              agent_name='carla-agent', record_dir='data/recordings', skip_frames=25):
         record_path = None
         should_record = isinstance(record_dir, str)
         should_save = isinstance(weights_dir, str)
@@ -208,44 +214,36 @@ class CARLAEnvironment(Environment):
             print(f'Using default agent...')
             agent = self.default_agent(max_episode_timesteps=max_episode_timesteps)
 
-        try:
-            if load_agent:
-                agent.load(directory=os.path.join(weights_dir, agent_name), filename=agent_name, environment=self,
-                           format='tensorflow')
-                print('Agent loaded.')
+        for episode in range(num_episodes):
+            states = self.reset()
+            total_reward = 0.0
 
-            for episode in range(num_episodes):
-                states = self.reset()
-                total_reward = 0.0
+            if should_record:
+                record_path = env_utils.get_record_path(base_dir=record_dir)
+                print(f'Recording in {record_path}.')
 
-                if should_record:
-                    record_path = env_utils.get_record_path(base_dir=record_dir)
-                    print(f'Recording in {record_path}.')
+            with self.synchronous_context:
+                self.skip(num_frames=skip_frames)
+                t0 = datetime.now()
 
-                with self.synchronous_context:
-                    self.skip(num_frames=skip_frames)
-                    t0 = datetime.now()
+                for i in range(max_episode_timesteps):
+                    actions = agent.act(states)
+                    states, terminal, reward = self.execute(actions, record_path=record_path)
 
-                    for i in range(max_episode_timesteps):
-                        actions = agent.act(states)
-                        states, terminal, reward = self.execute(actions, record_path=record_path)
+                    total_reward += reward
+                    terminal = terminal or (i == max_episode_timesteps - 1)
 
-                        total_reward += reward
-                        terminal = terminal or (i == max_episode_timesteps - 1)
+                    if agent.observe(reward, terminal):
+                        print(f'{i + 1}/{max_episode_timesteps} -> update performed.')
 
-                        if agent.observe(reward, terminal):
-                            print(f'{i + 1}/{max_episode_timesteps} -> update performed.')
+                    if terminal:
+                        elapsed = str(datetime.now() - t0).split('.')[0]
+                        print(f'Episode-{episode} completed in {elapsed}, total_reward: {round(total_reward, 2)}\n')
+                        break
 
-                        if terminal:
-                            elapsed = str(datetime.now() - t0).split('.')[0]
-                            print(f'Episode-{episode} completed in {elapsed}, total_reward: {round(total_reward, 2)}\n')
-                            break
-
-                if should_save:
-                    env_utils.save_agent(agent, agent_name, directory=weights_dir)
-                    print('Agent saved.')
-        finally:
-            self.close()
+            if should_save:
+                env_utils.save_agent(agent, agent_name, directory=weights_dir)
+                print('Agent saved.')
 
     def default_sensors(self) -> dict:
         """Returns a predefined dict of sensors specifications"""
@@ -270,6 +268,20 @@ class CARLAEnvironment(Environment):
             self.collision_penalty += penalty / 2.0 * impulse
         else:
             self.collision_penalty += penalty * impulse
+
+        def register_event(self, event: CARLAEvent, callback):
+        """Registers a given [callback] to a specific [event]"""
+        assert isinstance(event, CARLAEvent)
+        assert callable(callback)
+
+        callbacks = self.events.get(event, [])
+        callbacks.append(callback)
+        self.events[event] = callbacks
+
+    def trigger_event(self, event: CARLAEvent, **kwargs):
+        """Cause the call of every callback registered for event [event]"""
+        for callback in self.events.get(event, []):
+            callback(**kwargs)
 
     def render(self, sensors_data: dict):
         """Renders sensors' output"""
